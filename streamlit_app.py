@@ -1,10 +1,8 @@
-# CashQuest — Gamified Spending Coach (Hugging Face only, with Analytics)
+# CashQuest — Gamified Spending Coach (Hugging Face + Analytics + CSV upload in Sidebar)
 # Run: streamlit run streamlit_app.py
 
-import os, re, io
-from datetime import date, datetime
-from collections import defaultdict
-
+import os, re
+from datetime import date
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -13,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 st.set_page_config(page_title="CashQuest", page_icon="💰", layout="wide")
 
-# Hugging Face auth (optional but recommended for higher rate limits)
+# Hugging Face auth
 hf_token = os.getenv("HF_API_KEY")
 if hf_token:
     try:
@@ -57,8 +55,7 @@ def init_state():
         {"name":"₹200 Ride Credit", "cost":250, "redeemed":False},
         {"name":"Movie Ticket", "cost":400, "redeemed":False},
     ])
-    # history is a list of dict rows: date, spend, budget, category
-    st.session_state.setdefault("history", [])  
+    st.session_state.setdefault("history", [])
 init_state()
 
 CATEGORIES = ["Food", "Travel", "Shopping", "Bills", "Entertainment", "Health", "Education", "Other"]
@@ -68,7 +65,6 @@ def history_df() -> pd.DataFrame:
     if not st.session_state.history:
         return pd.DataFrame(columns=["date","spend","budget","category"])
     df = pd.DataFrame(st.session_state.history)
-    # ensure types
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["spend"] = pd.to_numeric(df["spend"], errors="coerce").fillna(0.0)
     df["budget"] = pd.to_numeric(df["budget"], errors="coerce").fillna(0.0)
@@ -77,7 +73,6 @@ def history_df() -> pd.DataFrame:
 
 # ============ SPEND LOGIC ============
 def log_entry(d: date, spend: float, budget: float, category: str):
-    # update daily gamification when logging "today"
     today = date.today()
     if d == today and st.session_state.get("last_logged") != today:
         st.session_state.today_spend = spend
@@ -89,7 +84,6 @@ def log_entry(d: date, spend: float, budget: float, category: str):
             st.session_state.streak = 0
         st.session_state.last_logged = today
 
-    # update or insert record for that date
     replaced = False
     for row in st.session_state.history:
         if row["date"] == d:
@@ -113,24 +107,19 @@ def redeem_coupon(i: int):
 
 # ============ TEXT CLEANUP ============
 def clean_answer(text: str) -> str:
-    """Remove loops/partials and ensure 2–3 unique sentences minimum."""
     sentences = re.split(r'(?<=[.!?]) +', text)
     cleaned = []
     for s in sentences:
         s_strip = s.strip()
-        if not s_strip: 
-            continue
-        # remove consecutive near-duplicates
+        if not s_strip: continue
         if cleaned and s_strip.lower().startswith(cleaned[-1][:18].lower()):
             continue
         if s_strip not in cleaned:
             cleaned.append(s_strip)
-
     if len(cleaned) < 2:
         cleaned.append("Start by setting aside a fixed amount each month in a savings account or recurring deposit.")
     if len(cleaned) < 3:
         cleaned.append("Track expenses by category to identify 1–2 areas to trim without changing your lifestyle.")
-
     return " ".join(cleaned[:5])
 
 # ============ AI (Hugging Face only) ============
@@ -161,25 +150,27 @@ with st.sidebar.expander("Today / Quick Stats", expanded=True):
     st.write(f"**Today's Spend:** ₹{st.session_state.today_spend:.0f}")
     st.write(f"**Daily Budget:** ₹{st.session_state.daily_budget:.0f}")
 
-# Data Tools
-with st.sidebar.expander("Data Tools", expanded=False):
+# CSV Tools (in Sidebar)
+with st.sidebar.expander("📂 Data Tools", expanded=False):
     df = history_df()
     if not df.empty:
-        # Export CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download History CSV", data=csv, file_name="cashquest_history.csv", mime="text/csv")
-    # Import CSV
-    up = st.file_uploader("Upload history CSV", type=["csv"])
-    if up is not None:
+    # Upload
+    sample_df = pd.DataFrame([{"date": date.today().isoformat(), "spend": 0, "budget": 0, "category": "Other"}])
+    st.download_button("⬇️ Download Template CSV", data=sample_df.to_csv(index=False).encode("utf-8"),
+                       file_name="cashquest_template.csv", mime="text/csv")
+    upload_mode = st.radio("Import mode", ("Replace", "Append"), horizontal=True)
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"], key="history_upload_sidebar")
+    if uploaded_file is not None:
         try:
-            new_df = pd.read_csv(up)
-            # validate columns
+            new_df = pd.read_csv(uploaded_file)
             needed = {"date","spend","budget","category"}
             if not needed.issubset(set(new_df.columns)):
                 st.error("CSV must have columns: date, spend, budget, category")
             else:
-                # replace history
-                st.session_state.history = []
+                if upload_mode == "Replace":
+                    st.session_state.history = []
                 for _, r in new_df.iterrows():
                     st.session_state.history.append({
                         "date": pd.to_datetime(r["date"]).date(),
@@ -187,12 +178,12 @@ with st.sidebar.expander("Data Tools", expanded=False):
                         "budget": float(r["budget"]),
                         "category": str(r["category"]),
                     })
-                st.success("✅ History imported.")
+                st.success(f"✅ CSV imported ({upload_mode}). Entries: {len(new_df)}")
         except Exception as e:
             st.error(f"Failed to import CSV: {e}")
 
 # Model options
-with st.sidebar.expander("AI Settings", expanded=False):
+with st.sidebar.expander("⚙️ AI Settings", expanded=False):
     hf_model_choice = st.selectbox(
         "Hugging Face model",
         ["google/flan-t5-base", "google/flan-t5-large", "google/flan-t5-small"],
@@ -221,14 +212,6 @@ if menu == "Dashboard":
         st.line_chart(df_sorted.set_index("date")["spend"], height=220)
         st.bar_chart(df_sorted.set_index("date")[["spend","budget"]], height=240)
 
-        # Quick aggregates (last 30 days)
-        last30 = df[df["date"] >= (date.today() - pd.Timedelta(days=30)).date()]
-        if not last30.empty:
-            total = last30["spend"].sum()
-            avg = last30["spend"].mean()
-            best = (last30["budget"] - last30["spend"]).max()
-            st.markdown(f"**Last 30 days:** Total spend ₹{total:.0f} • Avg/day ₹{avg:.0f} • Best under-budget day: ₹{best:.0f}")
-
 # --- Log Daily Spend ---
 elif menu == "Log Daily Spend":
     st.subheader("🗓 Log a transaction")
@@ -256,41 +239,23 @@ elif menu == "Monthly Analysis":
     st.subheader("📅 Monthly Analysis")
     df = history_df()
     if df.empty:
-        st.info("No data yet. Add entries in **Log Daily Spend**.")
+        st.info("No data yet.")
     else:
         df["dt"] = pd.to_datetime(df["date"])
         df["year"] = df["dt"].dt.year
         df["month"] = df["dt"].dt.month
-        years = sorted(df["year"].unique(), reverse=True)
-        sel_year = st.selectbox("Year", years, index=0)
+        sel_year = st.selectbox("Year", sorted(df["year"].unique(), reverse=True))
         months = sorted(df[df["year"]==sel_year]["month"].unique())
         month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
         sel_month = st.selectbox("Month", [month_names[m] for m in months], index=len(months)-1)
         sel_month_num = [k for k,v in month_names.items() if v==sel_month][0]
-
         mdf = df[(df["year"]==sel_year) & (df["month"]==sel_month_num)].copy()
-        mdf = mdf.sort_values("dt")
-        left, right = st.columns([1.2,1])
-        with left:
-            st.markdown("#### Daily spend vs budget")
-            st.bar_chart(mdf.set_index("date")[["spend","budget"]], height=260)
-        with right:
-            total = mdf["spend"].sum()
-            days = mdf["dt"].dt.day.nunique()
-            avg = mdf["spend"].mean()
-            under_days = int((mdf["spend"] <= mdf["budget"]).sum())
-            over_days = int((mdf["spend"] > mdf["budget"]).sum())
-            st.markdown(f"**Total:** ₹{total:.0f}")
-            st.markdown(f"**Avg/day:** ₹{avg:.0f}")
-            st.markdown(f"**Under/Over days:** {under_days}/{over_days}")
 
-        # Category breakdown
-        st.markdown("#### Category breakdown")
-        cat = mdf.groupby("category")["spend"].sum().sort_values(ascending=False)
+        st.bar_chart(mdf.set_index("date")[["spend","budget"]], height=260)
+        cat = mdf.groupby("category")["spend"].sum()
         if not cat.empty:
-            st.bar_chart(cat, height=240)
-        else:
-            st.write("No category data for this month.")
+            st.bar_chart(cat)
+            st.pyplot(cat.plot.pie(autopct="%1.1f%%", ylabel="").get_figure())
 
 # --- Yearly Trends ---
 elif menu == "Yearly Trends":
@@ -300,34 +265,18 @@ elif menu == "Yearly Trends":
         st.info("No data yet.")
     else:
         df["dt"] = pd.to_datetime(df["date"])
-        df["ym"] = df["dt"].dt.to_period("M").astype(str)
-        yearly = df.groupby(df["dt"].dt.to_period("M")).agg(
-            spend=("spend","sum"),
-            budget=("budget","sum")
-        ).reset_index()
+        yearly = df.groupby(df["dt"].dt.to_period("M")).agg(spend=("spend","sum"), budget=("budget","sum")).reset_index()
         yearly["month"] = yearly["dt"].astype(str)
-
-        st.markdown("#### Spend vs Budget by Month")
         st.line_chart(yearly.set_index("month")[["spend","budget"]], height=280)
-
-        st.markdown("#### Top categories (year-to-date)")
         ytd = df[df["dt"].dt.year == date.today().year]
-        topcats = ytd.groupby("category")["spend"].sum().sort_values(ascending=False).head(10)
+        topcats = ytd.groupby("category")["spend"].sum()
         if not topcats.empty:
-            st.bar_chart(topcats, height=260)
-        else:
-            st.write("No category data yet for this year.")
+            st.bar_chart(topcats)
+            st.pyplot(topcats.plot.pie(autopct="%1.1f%%", ylabel="").get_figure())
 
 # --- Rewards ---
 elif menu == "Rewards":
     st.subheader("🎁 Rewards & Coupons")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**Coins:** {st.session_state.coins}")
-        st.markdown(f"**Streak:** {st.session_state.streak} days")
-    with c2:
-        st.markdown("Earn coins by logging under-budget days. Redeem for rewards below.")
-
     for i, c in enumerate(st.session_state.coupons):
         cols = st.columns([4,2,2])
         with cols[0]:
@@ -344,18 +293,16 @@ elif menu == "Rewards":
 # --- AI Coach ---
 elif menu == "AI Coach":
     st.subheader("🤖 Personal Finance Coach")
-    persona = st.selectbox("Answer style", ["student", "professional", "beginner", "expert"], index=0)
-    q = st.text_area("Your question", placeholder="e.g., How can I reduce my monthly food spending by 20%?")
+    persona = st.selectbox("Answer style", ["student","professional","beginner","expert"], index=0)
+    q = st.text_area("Your question", placeholder="e.g., How can I reduce my monthly food spending?")
     if st.button("Ask"):
         if q.strip():
             with st.spinner("Thinking..."):
                 ans = ai_answer(q.strip(), persona=persona, model_name=hf_model_choice, max_new_tokens=max_tokens)
-            st.markdown("**Answer:**")
+            st.write("**Answer:**")
             st.write(ans)
-        else:
-            st.info("Type a question first.")
 
-# Footer controls
+# Reset button
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Reset (clear in-memory data)"):
     st.session_state.clear()
